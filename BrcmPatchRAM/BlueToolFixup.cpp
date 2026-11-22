@@ -246,12 +246,14 @@ static const uint8_t kSpecAdvSetsCapOriginal26[] =
     0x41, 0x89, 0xC6
 };
 
-// mov rcx, [rax]; mov rdi, rax; mov al, 1; nop x4; mov r14d, eax
+// mov rcx, [rax]; mov rdi, rax; mov eax, 1; nop; mov r14d, eax
+// (mov eax, not mov al: the next instruction copies all of eax, and with "mov al, 1" its upper bits
+// were the low bits of the object pointer in rax, so r14d was some pointer-derived value, not 1)
 static const uint8_t kSpecAdvSetsCapPatched26[] =
 {
     0x48, 0x8B, 0x08,
     0x48, 0x89, 0xC7,
-    0xB0, 0x01, 0x90, 0x90, 0x90, 0x90,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x90,
     0x41, 0x89, 0xC6
 };
 
@@ -355,6 +357,15 @@ static bool shouldPatchA2DPCheck = false;
 static bool loggedA2DPCheckMiss = false;
 static bool shouldPatchSpecAdvSets = false;
 
+// The advsets patches were made from bluetoothd of macOS 26.4.1 (25E253). Most of them contain
+// rip-relative displacements and simply never match another build, but the two capability patches
+// only match a vtable offset, which other builds use for other methods. They would then be applied
+// without the rest: bluetoothd mixes LE extended and legacy commands, the controller answers with
+// Command Disallowed, and bluetoothd restarts itself, dropping every connection.
+static bool isVerifiedSpecAdvSetsBuild() {
+    return getKernelVersion() == KernelVersion::Tahoe && getKernelMinorVersion() == 4;
+}
+
 static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
 static constexpr size_t kBoardIdSizeLegacy = sizeof("Mac-F22586C8");
 
@@ -454,9 +465,10 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                     patched |= searchAndPatchNamedWithMask(data, PAGE_SIZE, path, "fast-connect A2DP BT-clock gate (macOS 12/13)", kFastConnectA2DPGateOriginal12_0, kFastConnectA2DPGateMask12_0, kFastConnectA2DPGatePatched12_0, kFastConnectA2DPGateMask12_0);
                 }
 
+                // Most bluetoothd pages do not contain the gate, so a miss on one page means nothing
                 if (!patched && !loggedA2DPCheckMiss) {
                     loggedA2DPCheckMiss = true;
-                    SYSLOG(MODULE_SHORT, "[a2dpcheck] enabled for bluetoothd, but no known FastConnect Gate pattern was seen yet");
+                    DBGLOG(MODULE_SHORT, "[a2dpcheck] enabled for bluetoothd, waiting for the page with the FastConnect gate");
                 }
             }
             if (shouldPatchSpecAdvSets &&
@@ -510,6 +522,11 @@ static void pluginStart() {
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
         shouldPatchA2DPCheck = checkKernelArgument("-btlfxa2dpcheck");
         shouldPatchSpecAdvSets = checkKernelArgument("-btlfxadvsets");
+        if (shouldPatchSpecAdvSets && !isVerifiedSpecAdvSetsBuild() && !checkKernelArgument("-btlfxadvsetsforce")) {
+            SYSLOG(MODULE_SHORT, "[advsets] made for macOS 26.4.x only, not applied on Darwin %d.%d (-btlfxadvsetsforce overrides)",
+                   getKernelVersion(), getKernelMinorVersion());
+            shouldPatchSpecAdvSets = false;
+        }
         if (shouldPatchSpecAdvSets)
             SYSLOG(MODULE_SHORT, "[advsets] BT Spec LE advertising sets for third-party controllers enabled");
         if (shouldPatchA2DPCheck)

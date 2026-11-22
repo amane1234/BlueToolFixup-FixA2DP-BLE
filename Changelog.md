@@ -1,5 +1,11 @@
 BrcmPatchRAM Changelog
 ======================
+#### v2.7.3
+- Added `-btlfxa2dpcheck` Fast-Connect A2DP patch for "connected but no sound" on third-party controllers
+- Added `-btlfxadvsets` BLE advertising sets / extended scanning patches for third-party controllers
+- Limited `-btlfxadvsets` to macOS 26.4.x, the only build its patterns were made for (`-btlfxadvsetsforce` overrides)
+- Fixed `-btlfxadvsets` capability patch leaving the upper bits of the returned value undefined
+
 #### v2.7.2
 - Added `bluetoothd` patches for macOS 26 (thx @spotlightishere et al)
 
