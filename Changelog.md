@@ -5,6 +5,8 @@ BrcmPatchRAM Changelog
 - Added `-btlfxadvsets` BLE advertising sets / extended scanning patches for third-party controllers
 - Limited `-btlfxadvsets` to macOS 26.4.x, the only build its patterns were made for (`-btlfxadvsetsforce` overrides)
 - Fixed `-btlfxadvsets` capability patch leaving the upper bits of the returned value undefined
+- Added `btlfx-patched` property listing how often and at how many places every patch was applied
+- Log each patch once per place instead of on every page re-read
 
 #### v2.7.2
 - Added `bluetoothd` patches for macOS 26 (thx @spotlightishere et al)

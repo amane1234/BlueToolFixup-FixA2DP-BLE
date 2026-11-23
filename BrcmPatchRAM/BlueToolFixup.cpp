@@ -12,6 +12,8 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/kern_version.hpp>
 #include <Headers/kern_devinfo.hpp>
+#include <kern/thread_call.h>
+#include <libkern/OSAtomic.h>
 
 
 #define MODULE_SHORT "btlfx"
@@ -31,16 +33,6 @@ IOService *BlueToolFixup::probe(IOService *provider, SInt32 *score) {
     return ADDPR(startSuccess) ? IOService::probe(provider, score) : nullptr;
 }
 
-bool BlueToolFixup::start(IOService *provider) {
-    if (!IOService::start(provider)) {
-        SYSLOG("init", "failed to start the parent");
-        return false;
-    }
-    setProperty("VersionInfo", kextVersion);
-    registerService();
-    
-    return true;
-}
 
 
 #pragma mark - Patches
@@ -354,7 +346,6 @@ static bool shouldPatchBoardId = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
 static bool shouldPatchA2DPCheck = false;
-static bool loggedA2DPCheckMiss = false;
 static bool shouldPatchSpecAdvSets = false;
 
 // The advsets patches were made from bluetoothd of macOS 26.4.1 (25E253). Most of them contain
@@ -390,40 +381,185 @@ static mach_vm_address_t orig_cs_validate {};
 
 #pragma mark - Kernel patching code
 
-static inline void searchAndPatch(const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
-    if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize))
-        DBGLOG(MODULE_SHORT, "found string to patch at %s!", path);
+#pragma mark - Patch statistics
+
+// cs_validate_page runs on every page-in, so each patch is applied again whenever a bluetoothd page is evicted
+// and read back. To make it visible what really got patched, every patch counts how often it was applied and at
+// how many distinct places of the binary (file offsets). "sites" is the number to check: 1 for the a2dpcheck
+// gate and every advsets patch; more means the pattern also hit unrelated code, 0 that it never matched (other
+// macOS build, or the pattern straddles a page boundary). Published as the btlfx-patched property:
+//   ioreg -r -c BlueToolFixup -d1 | grep btlfx-patched
+// New sites are logged once; re-validations of a known site are only counted.
+
+static constexpr size_t kMaxTrackedSites = 8;
+
+struct PatchStat {
+    const char *name;
+    bool active;                                   // enabled for this boot (boot args, macOS version)
+    volatile SInt32 applied;                       // replacements, including re-validated pages
+    volatile SInt32 sites;                         // distinct file offsets, up to kMaxTrackedSites
+    volatile UInt64 siteOffsets[kMaxTrackedSites]; // file offset + 1, 0 = free slot
+    volatile bool moreSites;                       // more distinct sites than tracked
+};
+
+enum PatchId : size_t {
+    kPatchSkipUpdate,
+    kPatchBlueToolBoardId,
+    kPatchVendorCheck,
+    kPatchBadChipset,
+    kPatchBadChipset13_3,
+    kPatchBadChipset15_4,
+    kPatchNvramCheck,
+    kPatchBoardId,
+    kPatchAddressCheck,
+    kPatchA2DPGate,
+    kPatchSpecAdvSetsCap,
+    kPatchExtScanCap,
+    kPatchLeEventMask,
+    kPatchAdvSetAddr,
+    kPatchExtCreateConn,
+    kPatchAdvSetAddrResend,
+    kPatchCount
+};
+
+static PatchStat patchStats[kPatchCount] = {
+    { "BlueTool skip firmware update" },
+    { "BlueTool board-id" },
+    { "vendor check" },
+    { "bad chipset check" },
+    { "bad chipset check 13.3" },
+    { "bad chipset check 15.4" },
+    { "internal controller NVRAM check" },
+    { "board-id" },
+    { "address check" },
+    { "a2dpcheck fast-connect gate" },
+    { "advsets BT Spec advertising sets capability" },
+    { "advsets extended scanning capability" },
+    { "advsets LE event mask" },
+    { "advsets advertising set random address" },
+    { "advsets extended create connection" },
+    { "advsets advertising set address resend" },
+};
+
+// Property updates allocate and take registry locks, which must not happen inside cs_validate_page (VM fault
+// path). The page-in path only bumps counters and queues this thread call.
+static thread_call_t patchStatsCall {nullptr};
+static IOService *patchStatsService {nullptr};
+
+static void updatePatchStats(thread_call_param_t, thread_call_param_t) {
+    IOService *service = patchStatsService;
+    if (!service)
+        return;
+    OSDictionary *all = OSDictionary::withCapacity(kPatchCount);
+    if (!all)
+        return;
+    for (size_t i = 0; i < kPatchCount; i++) {
+        const PatchStat &stat = patchStats[i];
+        if (!stat.active)
+            continue;
+        OSDictionary *entry = OSDictionary::withCapacity(3);
+        OSNumber *applied = OSNumber::withNumber(static_cast<UInt32>(stat.applied), 32);
+        OSNumber *sites = OSNumber::withNumber(static_cast<UInt32>(stat.sites), 32);
+        if (entry && applied && sites) {
+            entry->setObject("applied", applied);
+            entry->setObject("sites", sites);
+            if (stat.moreSites)
+                entry->setObject("more-sites", kOSBooleanTrue);
+            all->setObject(stat.name, entry);
+        }
+        OSSafeReleaseNULL(applied);
+        OSSafeReleaseNULL(sites);
+        OSSafeReleaseNULL(entry);
+    }
+    service->setProperty("btlfx-patched", all);
+    all->release();
 }
 
-template <size_t findSize, size_t replaceSize, typename T>
-static inline void searchAndPatch(const void *haystack, size_t haystackSize, const char *path, const T (&needle)[findSize], const T (&patch)[replaceSize]) {
-    searchAndPatch(haystack, haystackSize, path, needle, findSize * sizeof(T), patch, replaceSize * sizeof(T));
+static void schedulePatchStatsUpdate() {
+    // Coalesces: a call that is already pending is not queued twice
+    if (patchStatsCall)
+        thread_call_enter(patchStatsCall);
 }
 
-static inline void searchAndPatchWithMask(const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize, const void *patchMask, size_t replaceMaskSize) {
-    if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, patchMask, replaceMaskSize))
-        DBGLOG(MODULE_SHORT, "found string to patch at %s!", path);
+// Returns true when this offset was not seen before
+static bool recordSite(PatchStat &stat, UInt64 fileOffset) {
+    const UInt64 key = fileOffset + 1;
+    for (size_t i = 0; i < kMaxTrackedSites; i++) {
+        UInt64 current = stat.siteOffsets[i];
+        if (current == key)
+            return false;
+        if (current == 0) {
+            if (OSCompareAndSwap64(0, key, &stat.siteOffsets[i])) {
+                OSIncrementAtomic(&stat.sites);
+                return true;
+            }
+            // Another CPU took the slot first; it may have stored this very offset
+            if (stat.siteOffsets[i] == key)
+                return false;
+        }
+    }
+    bool first = !stat.moreSites;
+    stat.moreSites = true;
+    return first;
 }
 
-template <size_t findSize, size_t findMaskSize, size_t replaceSize, size_t replaceMaskSize, typename T>
-static inline void searchAndPatchWithMask(const void *haystack, size_t haystackSize, const char *path, const T (&needle)[findSize], const T (&findMask)[findMaskSize], const T (&patch)[replaceSize], const T (&patchMask)[replaceMaskSize]) {
-    searchAndPatchWithMask(haystack, haystackSize, path, needle, findSize * sizeof(T), findMask, findMaskSize * sizeof(T), patch, replaceSize * sizeof(T), patchMask, replaceMaskSize * sizeof(T));
+// Replaces every match of find in the page, one at a time so that each site can be recorded. Masks, when given,
+// are findSize long; replaceSize may differ from findSize only without masks.
+static size_t applyPatch(PatchId id, const void *data, memory_object_offset_t pageOffset, const char *path,
+                         const void *find, size_t findSize, const void *findMask,
+                         const void *replace, size_t replaceSize, const void *replaceMask) {
+    PatchStat &stat = patchStats[id];
+    auto page = static_cast<uint8_t *>(const_cast<void *>(data));
+    size_t applied = 0;
+    size_t offset = 0;
+    while (offset + findSize <= PAGE_SIZE) {
+        size_t found = offset;
+        if (!KernelPatcher::findPattern(find, findMask, findSize, page, PAGE_SIZE, &found))
+            break;
+        // Patch exactly this occurrence
+        if (!KernelPatcher::findAndReplaceWithMask(page + found, findSize, find, findSize, findMask, findMask ? findSize : 0,
+                                                   replace, replaceSize, replaceMask, replaceMask ? findSize : 0, 1, 0))
+            break;
+        applied++;
+        const UInt64 fileOffset = static_cast<UInt64>(pageOffset) + found;
+        if (recordSite(stat, fileOffset))
+            SYSLOG(MODULE_SHORT, "patched %s in %s at 0x%llx", stat.name, path, fileOffset);
+        offset = found + findSize;
+    }
+    if (applied) {
+        OSAddAtomic(static_cast<SInt32>(applied), &stat.applied);
+        schedulePatchStatsUpdate();
+    }
+    return applied;
 }
 
+template <size_t findSize, size_t replaceSize>
+static inline size_t applyPatch(PatchId id, const void *data, memory_object_offset_t pageOffset, const char *path,
+                                const uint8_t (&find)[findSize], const uint8_t (&replace)[replaceSize]) {
+    return applyPatch(id, data, pageOffset, path, find, findSize, nullptr, replace, replaceSize, nullptr);
+}
 
+template <size_t size>
+static inline size_t applyPatchWithMask(PatchId id, const void *data, memory_object_offset_t pageOffset, const char *path,
+                                        const uint8_t (&find)[size], const uint8_t (&findMask)[size],
+                                        const uint8_t (&replace)[size], const uint8_t (&replaceMask)[size]) {
+    return applyPatch(id, data, pageOffset, path, find, size, findMask, replace, size, replaceMask);
+}
 
-
-static bool searchAndPatchNamedWithMask(const void *haystack, size_t haystackSize, const char *path, const char *name, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize, const void *patchMask, size_t replaceMaskSize) {
-    if (!KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, patchMask, replaceMaskSize))
+bool BlueToolFixup::start(IOService *provider) {
+    if (!IOService::start(provider)) {
+        SYSLOG("init", "failed to start the parent");
         return false;
+    }
+    setProperty("VersionInfo", kextVersion);
+    patchStatsService = this;
+    if (!patchStatsCall)
+        patchStatsCall = thread_call_allocate(updatePatchStats, nullptr);
+    // Patches applied before this service started are published now
+    updatePatchStats(nullptr, nullptr);
+    registerService();
 
-    SYSLOG(MODULE_SHORT, "[a2dpcheck] patched %s in %s", name, path);
     return true;
-}
-
-template <size_t findSize, size_t findMaskSize, size_t replaceSize, size_t replaceMaskSize, typename T>
-static bool searchAndPatchNamedWithMask(const void *haystack, size_t haystackSize, const char *path, const char *name, const T (&needle)[findSize], const T (&findMask)[findMaskSize], const T (&patch)[replaceSize], const T (&patchMask)[replaceMaskSize]) {
-    return searchAndPatchNamedWithMask(haystack, haystackSize, path, name, needle, findSize * sizeof(T), findMask, findMaskSize * sizeof(T), patch, replaceSize * sizeof(T), patchMask, replaceMaskSize * sizeof(T));
 }
 
 
@@ -436,59 +572,46 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
         if (strcmp(path + dirLength, "BlueTool") == 0) {
-            searchAndPatch(data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
+            applyPatch(kPatchSkipUpdate, data, page_offset, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
             if (shouldPatchBoardId)
-                searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                applyPatch(kPatchBlueToolBoardId, data, page_offset, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, nullptr,
+                           BaseDeviceInfo::get().boardIdentifier, kBoardIdSize, nullptr);
         }
         else if (strcmp(path + dirLength, "bluetoothd") == 0) {
-            searchAndPatch(data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
-            searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
-            if (getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia)
-                searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
-            if (getKernelVersion() >= KernelVersion::Sequoia)
-                searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
+            applyPatch(kPatchVendorCheck, data, page_offset, path, kVendorCheckOriginal, kVendorCheckPatched);
+            applyPatch(kPatchBadChipset, data, page_offset, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
+            if (patchStats[kPatchBadChipset13_3].active)
+                applyPatch(kPatchBadChipset13_3, data, page_offset, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
+            if (patchStats[kPatchBadChipset15_4].active)
+                applyPatch(kPatchBadChipset15_4, data, page_offset, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
             if (shouldPatchNvramCheck)
-                searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3), nullptr, 0);
+                applyPatch(kPatchNvramCheck, data, page_offset, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3),
+                           kSkipInternalControllerNVRAMCheckMask13_3, kSkipInternalControllerNVRAMCheckPatched13_3,
+                           sizeof(kSkipInternalControllerNVRAMCheckPatched13_3), nullptr);
             if (shouldPatchBoardId)
-                searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                applyPatch(kPatchBoardId, data, page_offset, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, nullptr,
+                           BaseDeviceInfo::get().boardIdentifier, kBoardIdSize, nullptr);
             if (shouldPatchAddress)
-                searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
+                applyPatchWithMask(kPatchAddressCheck, data, page_offset, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask,
+                                   kSkipAddressCheckPatched, kSkipAddressCheckMask);
             if (shouldPatchA2DPCheck) {
-                bool patched = false;
-                
                 // macOS 14.x/15.x/26.x (Sonoma/Sequoia/Tahoe) pattern
-                if (getKernelVersion() >= KernelVersion::Sonoma) {
-                    patched |= searchAndPatchNamedWithMask(data, PAGE_SIZE, path, "fast-connect A2DP BT-clock gate (macOS 14+)", kFastConnectA2DPGateOriginal14_0, kFastConnectA2DPGateMask14_0, kFastConnectA2DPGatePatched14_0, kFastConnectA2DPGateMask14_0);
-                }
+                if (getKernelVersion() >= KernelVersion::Sonoma)
+                    applyPatchWithMask(kPatchA2DPGate, data, page_offset, path, kFastConnectA2DPGateOriginal14_0, kFastConnectA2DPGateMask14_0,
+                                       kFastConnectA2DPGatePatched14_0, kFastConnectA2DPGateMask14_0);
                 // macOS 12.x/13.x (Monterey/Ventura) pattern
-                else if (getKernelVersion() >= KernelVersion::Monterey) {
-                    patched |= searchAndPatchNamedWithMask(data, PAGE_SIZE, path, "fast-connect A2DP BT-clock gate (macOS 12/13)", kFastConnectA2DPGateOriginal12_0, kFastConnectA2DPGateMask12_0, kFastConnectA2DPGatePatched12_0, kFastConnectA2DPGateMask12_0);
-                }
-
-                // Most bluetoothd pages do not contain the gate, so a miss on one page means nothing
-                if (!patched && !loggedA2DPCheckMiss) {
-                    loggedA2DPCheckMiss = true;
-                    DBGLOG(MODULE_SHORT, "[a2dpcheck] enabled for bluetoothd, waiting for the page with the FastConnect gate");
-                }
+                else
+                    applyPatchWithMask(kPatchA2DPGate, data, page_offset, path, kFastConnectA2DPGateOriginal12_0, kFastConnectA2DPGateMask12_0,
+                                       kFastConnectA2DPGatePatched12_0, kFastConnectA2DPGateMask12_0);
             }
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kSpecAdvSetsCapOriginal26, sizeof(kSpecAdvSetsCapOriginal26), kSpecAdvSetsCapPatched26, sizeof(kSpecAdvSetsCapPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched BT Spec advertising sets capability in %s", path);
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kExtScanCapOriginal26, sizeof(kExtScanCapOriginal26), kSpecAdvSetsCapPatched26, sizeof(kSpecAdvSetsCapPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched extended scanning capability in %s", path);
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kLeEventMaskOriginal26, sizeof(kLeEventMaskOriginal26), kLeEventMaskPatched26, sizeof(kLeEventMaskPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched LE event mask in %s", path);
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAdvSetAddrOriginal26, sizeof(kAdvSetAddrOriginal26), kAdvSetAddrPatched26, sizeof(kAdvSetAddrPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched advertising set random address in %s", path);
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kExtCreateConnOriginal26, sizeof(kExtCreateConnOriginal26), kExtCreateConnPatched26, sizeof(kExtCreateConnPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched extended create connection in %s", path);
-            if (shouldPatchSpecAdvSets &&
-                KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, kAdvSetAddrResendOriginal26, sizeof(kAdvSetAddrResendOriginal26), kAdvSetAddrResendPatched26, sizeof(kAdvSetAddrResendPatched26)))
-                SYSLOG(MODULE_SHORT, "[advsets] patched advertising set address resend in %s", path);
+            if (shouldPatchSpecAdvSets) {
+                applyPatch(kPatchSpecAdvSetsCap, data, page_offset, path, kSpecAdvSetsCapOriginal26, kSpecAdvSetsCapPatched26);
+                applyPatch(kPatchExtScanCap, data, page_offset, path, kExtScanCapOriginal26, kSpecAdvSetsCapPatched26);
+                applyPatch(kPatchLeEventMask, data, page_offset, path, kLeEventMaskOriginal26, kLeEventMaskPatched26);
+                applyPatch(kPatchAdvSetAddr, data, page_offset, path, kAdvSetAddrOriginal26, kAdvSetAddrPatched26);
+                applyPatch(kPatchExtCreateConn, data, page_offset, path, kExtCreateConnOriginal26, kExtCreateConnPatched26);
+                applyPatch(kPatchAdvSetAddrResend, data, page_offset, path, kAdvSetAddrResendOriginal26, kAdvSetAddrResendPatched26);
+            }
         }
     }
 }
@@ -531,6 +654,19 @@ static void pluginStart() {
             SYSLOG(MODULE_SHORT, "[advsets] BT Spec LE advertising sets for third-party controllers enabled");
         if (shouldPatchA2DPCheck)
             SYSLOG(MODULE_SHORT, "[a2dpcheck] bluetoothd Read Clock workaround enabled (fast-connect A2DP bypass)");
+        // Which patches this boot uses: only those are listed in btlfx-patched
+        patchStats[kPatchSkipUpdate].active = true;
+        patchStats[kPatchBlueToolBoardId].active = shouldPatchBoardId;
+        patchStats[kPatchVendorCheck].active = true;
+        patchStats[kPatchBadChipset].active = true;
+        patchStats[kPatchBadChipset13_3].active = getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia;
+        patchStats[kPatchBadChipset15_4].active = getKernelVersion() >= KernelVersion::Sequoia;
+        patchStats[kPatchNvramCheck].active = shouldPatchNvramCheck;
+        patchStats[kPatchBoardId].active = shouldPatchBoardId;
+        patchStats[kPatchAddressCheck].active = shouldPatchAddress;
+        patchStats[kPatchA2DPGate].active = shouldPatchA2DPCheck;
+        for (size_t i = kPatchSpecAdvSetsCap; i <= kPatchAdvSetAddrResend; i++)
+            patchStats[i].active = shouldPatchSpecAdvSets;
         KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
             SYSLOG(MODULE_SHORT, "failed to route cs validation pages");

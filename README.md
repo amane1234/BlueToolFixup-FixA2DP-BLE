@@ -184,7 +184,9 @@ It is recommended to do it through OpenCore NVRAM section. On macOS 14 and older
 Optional `bluetoothd` patches for third-party controllers (off by default):
 
 * `-btlfxa2dpcheck` — skip the BT clock check in the Fast-Connect A2DP reconnect path ("connected but no sound" with AirPods and other W1/H1/H2 headphones), macOS 12+.
-* `-btlfxadvsets` — let `bluetoothd` use Bluetooth 5.0 LE advertising sets, extended scanning and extended create connection (AirDrop/Continuity discovery). Made for macOS 26.4.x (`bluetoothd` of 26.4.1, 25E253) and only applied there. The controller must support LE extended advertising (Bluetooth 5.0+); on older controllers `bluetoothd` gets Command Disallowed errors, restarts and drops connections. `-btlfxadvsetsforce` applies it on other macOS versions anyway, which only makes sense after checking that all six patches still match (each one logs `[advsets] patched ...` to the kernel log).
+* `-btlfxadvsets` — let `bluetoothd` use Bluetooth 5.0 LE advertising sets, extended scanning and extended create connection (AirDrop/Continuity discovery). Made for macOS 26.4.x (`bluetoothd` of 26.4.1, 25E253) and only applied there. The controller must support LE extended advertising (Bluetooth 5.0+); on older controllers `bluetoothd` gets Command Disallowed errors, restarts and drops connections. `-btlfxadvsetsforce` applies it on other macOS versions anyway, which only makes sense after checking that all six patches still match (see below).
+
+To see which `bluetoothd`/`BlueTool` patches were applied, run `ioreg -r -c BlueToolFixup -d1 | grep btlfx-patched`. Every patch active on this boot is listed with `applied` (how often it was written, page re-reads included) and `sites` (how many distinct places of the binary it hit). `sites` should be 1 for the `-btlfxa2dpcheck` gate and for each `-btlfxadvsets` patch: 0 means it did not match this macOS build, more than 1 that the pattern also hit unrelated code. The first patch at each place is also logged once (`log show --last boot | grep btlfx`).
 
 ### Supported Devices
 
