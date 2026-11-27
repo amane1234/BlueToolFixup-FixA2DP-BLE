@@ -24,6 +24,7 @@ class EXPORT BlueToolFixup : public IOService {
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
 };
 
 OSDefineMetaClassAndStructors(BlueToolFixup, IOService)
@@ -353,12 +354,18 @@ static bool shouldPatchSpecAdvSets = false;
 // only match a vtable offset, which other builds use for other methods. They would then be applied
 // without the rest: bluetoothd mixes LE extended and legacy commands, the controller answers with
 // Command Disallowed, and bluetoothd restarts itself, dropping every connection.
-static bool isVerifiedSpecAdvSetsBuild() {
-    return getKernelVersion() == KernelVersion::Tahoe && getKernelMinorVersion() == 4;
+static bool isVerifiedSpecAdvSetsBuild(KernelPatcher &patcher) {
+    if (getKernelVersion() != KernelVersion::Tahoe)
+        return false;
+    auto build = reinterpret_cast<const char *>(patcher.solveSymbol(KernelPatcher::KernelID, "_osversion"));
+    if (!build) patcher.clearError();
+    return build && !strncmp(build, "25E253", sizeof("25E253"));
 }
 
 static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
 static constexpr size_t kBoardIdSizeLegacy = sizeof("Mac-F22586C8");
+
+static char replacementBoardId[kBoardIdSize] {};
 
 static const char boardIdsWithUSBBluetooth[][kBoardIdSize] = {
     "Mac-F60DEB81FF30ACF6",
@@ -444,26 +451,34 @@ static PatchStat patchStats[kPatchCount] = {
 // Property updates allocate and take registry locks, which must not happen inside cs_validate_page (VM fault
 // path). The page-in path only bumps counters and queues this thread call.
 static thread_call_t patchStatsCall {nullptr};
+static IOLock *statsLock;
+static bool statsQueued;
 static IOService *patchStatsService {nullptr};
 
 static void updatePatchStats(thread_call_param_t, thread_call_param_t) {
+    __atomic_store_n(&statsQueued, false, __ATOMIC_RELEASE);
+    IOLockLock(statsLock);
     IOService *service = patchStatsService;
+    if (service) service->retain();
+    IOLockUnlock(statsLock);
     if (!service)
         return;
     OSDictionary *all = OSDictionary::withCapacity(kPatchCount);
-    if (!all)
+    if (!all) {
+        service->release();
         return;
+    }
     for (size_t i = 0; i < kPatchCount; i++) {
         const PatchStat &stat = patchStats[i];
         if (!stat.active)
             continue;
         OSDictionary *entry = OSDictionary::withCapacity(3);
-        OSNumber *applied = OSNumber::withNumber(static_cast<UInt32>(stat.applied), 32);
-        OSNumber *sites = OSNumber::withNumber(static_cast<UInt32>(stat.sites), 32);
+        OSNumber *applied = OSNumber::withNumber(__atomic_load_n(&stat.applied, __ATOMIC_RELAXED), 32);
+        OSNumber *sites = OSNumber::withNumber(__atomic_load_n(&stat.sites, __ATOMIC_RELAXED), 32);
         if (entry && applied && sites) {
             entry->setObject("applied", applied);
             entry->setObject("sites", sites);
-            if (stat.moreSites)
+            if (__atomic_load_n(&stat.moreSites, __ATOMIC_RELAXED))
                 entry->setObject("more-sites", kOSBooleanTrue);
             all->setObject(stat.name, entry);
         }
@@ -473,19 +488,23 @@ static void updatePatchStats(thread_call_param_t, thread_call_param_t) {
     }
     service->setProperty("btlfx-patched", all);
     all->release();
+    service->release();
 }
 
 static void schedulePatchStatsUpdate() {
     // Coalesces: a call that is already pending is not queued twice
-    if (patchStatsCall)
-        thread_call_enter(patchStatsCall);
+    if (patchStatsCall && !__atomic_exchange_n(&statsQueued, true, __ATOMIC_ACQ_REL)) {
+        uint64_t deadline;
+        clock_interval_to_deadline(250, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(patchStatsCall, deadline);
+    }
 }
 
 // Returns true when this offset was not seen before
 static bool recordSite(PatchStat &stat, UInt64 fileOffset) {
     const UInt64 key = fileOffset + 1;
     for (size_t i = 0; i < kMaxTrackedSites; i++) {
-        UInt64 current = stat.siteOffsets[i];
+        UInt64 current = __atomic_load_n(&stat.siteOffsets[i], __ATOMIC_ACQUIRE);
         if (current == key)
             return false;
         if (current == 0) {
@@ -494,13 +513,11 @@ static bool recordSite(PatchStat &stat, UInt64 fileOffset) {
                 return true;
             }
             // Another CPU took the slot first; it may have stored this very offset
-            if (stat.siteOffsets[i] == key)
+            if (__atomic_load_n(&stat.siteOffsets[i], __ATOMIC_ACQUIRE) == key)
                 return false;
         }
     }
-    bool first = !stat.moreSites;
-    stat.moreSites = true;
-    return first;
+    return !__atomic_exchange_n(&stat.moreSites, true, __ATOMIC_RELAXED);
 }
 
 // Replaces every match of find in the page, one at a time so that each site can be recorded. Masks, when given,
@@ -512,10 +529,18 @@ static size_t applyPatch(PatchId id, const void *data, memory_object_offset_t pa
     auto page = static_cast<uint8_t *>(const_cast<void *>(data));
     size_t applied = 0;
     size_t offset = 0;
-    while (offset + findSize <= PAGE_SIZE) {
+    if (!findSize || findSize > PAGE_SIZE || replaceSize > findSize)
+        return 0;
+    while (offset <= PAGE_SIZE - findSize) {
         size_t found = offset;
         if (!KernelPatcher::findPattern(find, findMask, findSize, page, PAGE_SIZE, &found))
             break;
+        // Instruction edits must have an unambiguous match in this page.
+        if (id != kPatchSkipUpdate && id != kPatchBoardId && id != kPatchBlueToolBoardId) {
+            size_t second = found + 1;
+            if (KernelPatcher::findPattern(find, findMask, findSize, page, PAGE_SIZE, &second))
+                return 0;
+        }
         // Patch exactly this occurrence
         if (!KernelPatcher::findAndReplaceWithMask(page + found, findSize, find, findSize, findMask, findMask ? findSize : 0,
                                                    replace, replaceSize, replaceMask, replaceMask ? findSize : 0, 1, 0))
@@ -552,16 +577,26 @@ bool BlueToolFixup::start(IOService *provider) {
         return false;
     }
     setProperty("VersionInfo", kextVersion);
-    patchStatsService = this;
-    if (!patchStatsCall)
-        patchStatsCall = thread_call_allocate(updatePatchStats, nullptr);
-    // Patches applied before this service started are published now
-    updatePatchStats(nullptr, nullptr);
+    if (statsLock) {
+        IOLockLock(statsLock);
+        patchStatsService = this;
+        IOLockUnlock(statsLock);
+        schedulePatchStatsUpdate();
+    }
     registerService();
 
     return true;
 }
 
+
+void BlueToolFixup::stop(IOService *provider) {
+    if (statsLock) {
+        IOLockLock(statsLock);
+        if (patchStatsService == this) patchStatsService = nullptr;
+        IOLockUnlock(statsLock);
+    }
+    IOService::stop(provider);
+}
 
 #pragma mark - Patched functions
 
@@ -569,13 +604,15 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     char path[PATH_MAX];
     int pathlen = PATH_MAX;
     FunctionCast(patched_cs_validate_page, orig_cs_validate)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
+    if (!vp || !data || !validated_p || !*validated_p || !tainted_p || *tainted_p)
+        return;
     static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
         if (strcmp(path + dirLength, "BlueTool") == 0) {
             applyPatch(kPatchSkipUpdate, data, page_offset, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
             if (shouldPatchBoardId)
                 applyPatch(kPatchBlueToolBoardId, data, page_offset, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, nullptr,
-                           BaseDeviceInfo::get().boardIdentifier, kBoardIdSize, nullptr);
+                           replacementBoardId, sizeof(replacementBoardId), nullptr);
         }
         else if (strcmp(path + dirLength, "bluetoothd") == 0) {
             applyPatch(kPatchVendorCheck, data, page_offset, path, kVendorCheckOriginal, kVendorCheckPatched);
@@ -590,7 +627,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                            sizeof(kSkipInternalControllerNVRAMCheckPatched13_3), nullptr);
             if (shouldPatchBoardId)
                 applyPatch(kPatchBoardId, data, page_offset, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, nullptr,
-                           BaseDeviceInfo::get().boardIdentifier, kBoardIdSize, nullptr);
+                           replacementBoardId, sizeof(replacementBoardId), nullptr);
             if (shouldPatchAddress)
                 applyPatchWithMask(kPatchAddressCheck, data, page_offset, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask,
                                    kSkipAddressCheckPatched, kSkipAddressCheckMask);
@@ -624,29 +661,35 @@ static void pluginStart() {
     // There is no point in routing cs_validate_range, because this kext should only be running on Monterey+
     if (getKernelVersion() < KernelVersion::Monterey)
         return;
+    statsLock = IOLockAlloc();
+    if (statsLock)
+        patchStatsCall = thread_call_allocate_with_options(updatePatchStats, nullptr,
+            THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     lilu.onPatcherLoadForce([](void *user, KernelPatcher &patcher) {
-        if (getKernelVersion() >= KernelVersion::Sonoma) {
-            shouldPatchBoardId = checkKernelArgument("-btlfxboardid");
-        } else {
-            auto boardId = BaseDeviceInfo::get().boardIdentifier;
-            auto boardIdSize = strlen(boardId) + 1;
-            shouldPatchBoardId = boardIdSize == kBoardIdSize || boardIdSize == kBoardIdSizeLegacy;
+        const char *board = BaseDeviceInfo::get().boardIdentifier;
+        size_t len = board ? strnlen(board, kBoardIdSize) : 0;
+        if ((len + 1 == kBoardIdSize || len + 1 == kBoardIdSizeLegacy) &&
+            !memcmp(board, "Mac-", 4)) {
+            shouldPatchBoardId = getKernelVersion() < KernelVersion::Sonoma || checkKernelArgument("-btlfxboardid");
+            for (size_t i = 4; i < len; ++i)
+                if (!((board[i] >= '0' && board[i] <= '9') || (board[i] >= 'A' && board[i] <= 'F') ||
+                      (board[i] >= 'a' && board[i] <= 'f')))
+                    shouldPatchBoardId = false;
+            for (const auto &known : boardIdsWithUSBBluetooth)
+                if (!strcmp(board, known))
+                    shouldPatchBoardId = false;
             if (shouldPatchBoardId)
-                for (size_t i = 0; i < arrsize(boardIdsWithUSBBluetooth); i++)
-                    if (strcmp(boardIdsWithUSBBluetooth[i], boardId) == 0) {
-                        shouldPatchBoardId = false;
-                        break;
-                    }
+                memcpy(replacementBoardId, board, len);
         }
         if ((getKernelVersion() == KernelVersion::Monterey && getKernelMinorVersion() >= 5) || getKernelVersion() > KernelVersion::Monterey)
             // 12.4 Beta 3+, XNU 21.5
             shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
         if (getKernelVersion() <= KernelVersion::Sonoma)
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
-        shouldPatchA2DPCheck = checkKernelArgument("-btlfxa2dpcheck");
+        shouldPatchA2DPCheck = getKernelVersion() <= KernelVersion::Tahoe && checkKernelArgument("-btlfxa2dpcheck");
         shouldPatchSpecAdvSets = checkKernelArgument("-btlfxadvsets");
-        if (shouldPatchSpecAdvSets && !isVerifiedSpecAdvSetsBuild() && !checkKernelArgument("-btlfxadvsetsforce")) {
-            SYSLOG(MODULE_SHORT, "[advsets] made for macOS 26.4.x only, not applied on Darwin %d.%d (-btlfxadvsetsforce overrides)",
+        if (shouldPatchSpecAdvSets && !isVerifiedSpecAdvSetsBuild(patcher) && !checkKernelArgument("-btlfxadvsetsforce")) {
+            SYSLOG(MODULE_SHORT, "[advsets] tested on build 25E253 only, not applied on Darwin %d.%d (-btlfxadvsetsforce overrides)",
                    getKernelVersion(), getKernelMinorVersion());
             shouldPatchSpecAdvSets = false;
         }
