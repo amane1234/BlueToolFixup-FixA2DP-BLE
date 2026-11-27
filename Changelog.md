@@ -7,6 +7,11 @@ BrcmPatchRAM Changelog
 - Fixed `-btlfxadvsets` capability patch leaving the upper bits of the returned value undefined
 - Added `btlfx-patched` property listing how often and at how many places every patch was applied
 - Log each patch once per place instead of on every page re-read
+- Limited `-btlfxadvsets` further to build 25E253, checked when `bluetoothd` loads (`kern.osversion` is still empty when the patcher starts)
+- `-btlfxa2dpcheck` and `-btlfxadvsets` edits are skipped in a page where their pattern matches twice
+- Patches are only applied to pages that validated cleanly
+- `-btlfxboardid` only uses a well-formed `Mac-…` board-id
+- Added `scripts/check_advsets.py` to check the advsets patterns against a `bluetoothd` binary
 
 #### v2.7.2
 - Added `bluetoothd` patches for macOS 26 (thx @spotlightishere et al)

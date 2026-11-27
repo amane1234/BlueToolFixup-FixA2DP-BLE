@@ -354,12 +354,31 @@ static bool shouldPatchSpecAdvSets = false;
 // only match a vtable offset, which other builds use for other methods. They would then be applied
 // without the rest: bluetoothd mixes LE extended and legacy commands, the controller answers with
 // Command Disallowed, and bluetoothd restarts itself, dropping every connection.
-static bool isVerifiedSpecAdvSetsBuild(KernelPatcher &patcher) {
-    if (getKernelVersion() != KernelVersion::Tahoe)
+//
+// The build is checked against kern.osversion. launchd writes it from userspace, after Lilu's patcher
+// callback has run (it is still empty then), but before any daemon starts. So the decision is taken
+// when bluetoothd pages are validated, and cached once osversion is known.
+static const char *kernelOsVersion {nullptr};
+static bool specAdvSetsForced = false;
+static volatile SInt32 specAdvSetsDecision = 0; // 0 undecided, 1 verified build, -1 other build
+
+static void refuseSpecAdvSets();
+
+static bool specAdvSetsAllowed() {
+    if (specAdvSetsForced)
+        return true;
+    SInt32 decision = __atomic_load_n(&specAdvSetsDecision, __ATOMIC_ACQUIRE);
+    if (decision)
+        return decision > 0;
+    // Not written yet: patch nothing now and decide on a later page
+    if (!kernelOsVersion || !kernelOsVersion[0])
         return false;
-    auto build = reinterpret_cast<const char *>(patcher.solveSymbol(KernelPatcher::KernelID, "_osversion"));
-    if (!build) patcher.clearError();
-    return build && !strncmp(build, "25E253", sizeof("25E253"));
+    bool verified = !strncmp(kernelOsVersion, "25E253", sizeof("25E253"));
+    SInt32 expected = 0;
+    if (__atomic_compare_exchange_n(&specAdvSetsDecision, &expected, verified ? 1 : -1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && !verified)
+        refuseSpecAdvSets();
+    return verified;
 }
 
 static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
@@ -500,6 +519,14 @@ static void schedulePatchStatsUpdate() {
     }
 }
 
+// Runs once, in the page-in path: only flags and the coalesced stats call
+static void refuseSpecAdvSets() {
+    SYSLOG(MODULE_SHORT, "[advsets] tested on build 25E253 only, not applied on build %s (-btlfxadvsetsforce overrides)", kernelOsVersion);
+    for (size_t i = kPatchSpecAdvSetsCap; i <= kPatchAdvSetAddrResend; i++)
+        patchStats[i].active = false;
+    schedulePatchStatsUpdate();
+}
+
 // Returns true when this offset was not seen before
 static bool recordSite(PatchStat &stat, UInt64 fileOffset) {
     const UInt64 key = fileOffset + 1;
@@ -520,6 +547,13 @@ static bool recordSite(PatchStat &stat, UInt64 fileOffset) {
     return !__atomic_exchange_n(&stat.moreSites, true, __ATOMIC_RELAXED);
 }
 
+// The a2dpcheck gate and the advsets edits hit exactly one place of bluetoothd. A second match in the same page means
+// the pattern is not the code it was written for, so that page is left alone. The upstream patches (vendor and chipset
+// checks, NVRAM, address check) keep patching every match, as BlueToolFixup always did.
+static bool requiresUniqueMatch(PatchId id) {
+    return id >= kPatchA2DPGate && id <= kPatchAdvSetAddrResend;
+}
+
 // Replaces every match of find in the page, one at a time so that each site can be recorded. Masks, when given,
 // are findSize long; replaceSize may differ from findSize only without masks.
 static size_t applyPatch(PatchId id, const void *data, memory_object_offset_t pageOffset, const char *path,
@@ -535,8 +569,8 @@ static size_t applyPatch(PatchId id, const void *data, memory_object_offset_t pa
         size_t found = offset;
         if (!KernelPatcher::findPattern(find, findMask, findSize, page, PAGE_SIZE, &found))
             break;
-        // Instruction edits must have an unambiguous match in this page.
-        if (id != kPatchSkipUpdate && id != kPatchBoardId && id != kPatchBlueToolBoardId) {
+        // Single-site edits must have an unambiguous match in this page.
+        if (requiresUniqueMatch(id)) {
             size_t second = found + 1;
             if (KernelPatcher::findPattern(find, findMask, findSize, page, PAGE_SIZE, &second))
                 return 0;
@@ -641,7 +675,7 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                     applyPatchWithMask(kPatchA2DPGate, data, page_offset, path, kFastConnectA2DPGateOriginal12_0, kFastConnectA2DPGateMask12_0,
                                        kFastConnectA2DPGatePatched12_0, kFastConnectA2DPGateMask12_0);
             }
-            if (shouldPatchSpecAdvSets) {
+            if (shouldPatchSpecAdvSets && specAdvSetsAllowed()) {
                 applyPatch(kPatchSpecAdvSetsCap, data, page_offset, path, kSpecAdvSetsCapOriginal26, kSpecAdvSetsCapPatched26);
                 applyPatch(kPatchExtScanCap, data, page_offset, path, kExtScanCapOriginal26, kSpecAdvSetsCapPatched26);
                 applyPatch(kPatchLeEventMask, data, page_offset, path, kLeEventMaskOriginal26, kLeEventMaskPatched26);
@@ -667,7 +701,9 @@ static void pluginStart() {
             THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     lilu.onPatcherLoadForce([](void *user, KernelPatcher &patcher) {
         const char *board = BaseDeviceInfo::get().boardIdentifier;
-        size_t len = board ? strnlen(board, kBoardIdSize) : 0;
+        size_t len = 0;
+        while (board && len < kBoardIdSize && board[len])
+            len++;
         if ((len + 1 == kBoardIdSize || len + 1 == kBoardIdSizeLegacy) &&
             !memcmp(board, "Mac-", 4)) {
             shouldPatchBoardId = getKernelVersion() < KernelVersion::Sonoma || checkKernelArgument("-btlfxboardid");
@@ -688,13 +724,24 @@ static void pluginStart() {
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
         shouldPatchA2DPCheck = getKernelVersion() <= KernelVersion::Tahoe && checkKernelArgument("-btlfxa2dpcheck");
         shouldPatchSpecAdvSets = checkKernelArgument("-btlfxadvsets");
-        if (shouldPatchSpecAdvSets && !isVerifiedSpecAdvSetsBuild(patcher) && !checkKernelArgument("-btlfxadvsetsforce")) {
-            SYSLOG(MODULE_SHORT, "[advsets] tested on build 25E253 only, not applied on Darwin %d.%d (-btlfxadvsetsforce overrides)",
-                   getKernelVersion(), getKernelMinorVersion());
-            shouldPatchSpecAdvSets = false;
+        specAdvSetsForced = shouldPatchSpecAdvSets && checkKernelArgument("-btlfxadvsetsforce");
+        if (shouldPatchSpecAdvSets && !specAdvSetsForced) {
+            if (getKernelVersion() != KernelVersion::Tahoe) {
+                SYSLOG(MODULE_SHORT, "[advsets] tested on build 25E253 only, not applied on Darwin %d.%d (-btlfxadvsetsforce overrides)",
+                       getKernelVersion(), getKernelMinorVersion());
+                shouldPatchSpecAdvSets = false;
+            } else {
+                kernelOsVersion = reinterpret_cast<const char *>(patcher.solveSymbol(KernelPatcher::KernelID, "_osversion"));
+                if (!kernelOsVersion) {
+                    patcher.clearError();
+                    SYSLOG(MODULE_SHORT, "[advsets] cannot resolve osversion to check the build, not applied (-btlfxadvsetsforce overrides)");
+                    shouldPatchSpecAdvSets = false;
+                }
+            }
         }
         if (shouldPatchSpecAdvSets)
-            SYSLOG(MODULE_SHORT, "[advsets] BT Spec LE advertising sets for third-party controllers enabled");
+            SYSLOG(MODULE_SHORT, "[advsets] BT Spec LE advertising sets for third-party controllers %s",
+                   specAdvSetsForced ? "enabled (forced)" : "requested, applied once bluetoothd runs on build 25E253");
         if (shouldPatchA2DPCheck)
             SYSLOG(MODULE_SHORT, "[a2dpcheck] bluetoothd Read Clock workaround enabled (fast-connect A2DP bypass)");
         // Which patches this boot uses: only those are listed in btlfx-patched
