@@ -394,6 +394,19 @@ Firmwares can also be loaded directly from BrcmFirmwareRepo.kext/Contents/Resour
  Copying an existing IOKit personality and modifying its properties is the easiest way to do this. 
  Configure the earlier firmware using its unique firmware key.
 
+### Building
+
+Needs macOS with Xcode and git. `scripts/build.sh` (which builds every kext of this repository through the `Package` target, BlueToolFixup included) clones MacKernelSDK, builds a Debug `Lilu.kext` from source (only its SDK is used) and runs the same `xcodebuild` steps as the CI:
+
+```
+scripts/build.sh                # Release
+scripts/build.sh -c all         # Debug and Release
+scripts/build.sh --clean        # rebuild from scratch
+scripts/build.sh --update-deps  # update MacKernelSDK and Lilu
+```
+
+`LILU_KEXT=/path/Lilu.kext` uses an existing Lilu (for example a DEBUG release) instead of building one; `LILU_REF` and `MKSDK_REF` pick the revisions. The zips are listed at the end.
+
 ### Support and discussion  
 [InsanelyMac topic](https://www.insanelymac.com/forum/topic/339175-brcmpatchram2-for-1015-catalina-broadcom-bluetooth-firmware-upload/) in English  
 [AppleLife topic](https://applelife.ru/threads/bluetooth.2944352/) in Russian  
